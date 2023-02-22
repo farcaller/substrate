@@ -102,6 +102,7 @@ mod tests;
 use crate::{
 	exec::{AccountIdOf, ErrorOrigin, ExecError, Executable, Key, Stack as ExecStack},
 	gas::GasMeter,
+	migration::Progress as MigrationProgress,
 	storage::{meter::Meter as StorageMeter, ContractInfo, DeletedContract},
 	wasm::{OwnerInfo, PrefabWasmModule, TryInstantiate},
 	weights::WeightInfo,
@@ -356,6 +357,8 @@ pub mod pallet {
 		}
 
 		fn integrity_test() {
+			Migration::<T>::integrity_test();
+
 			// Total runtime memory is expected to have 128Mb upper limit
 			const MAX_RUNTIME_MEM: u32 = 1024 * 1024 * 128;
 			// Memory limits for a single contract:
@@ -960,6 +963,10 @@ pub mod pallet {
 	#[pallet::storage]
 	pub(crate) type DeletionQueue<T: Config> =
 		StorageValue<_, BoundedVec<DeletedContract, T::DeletionQueueDepth>, ValueQuery>;
+
+	#[pallet::storage]
+	pub(crate) type MigrationInProgress<T: Config> =
+		StorageValue<_, MigrationProgress, OptionQuery>;
 }
 
 /// Context of a contract invocation.
