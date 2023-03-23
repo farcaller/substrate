@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{CodeHash, Config, MigrationInProgress, Pallet, Weight, LOG_TARGET};
+use crate::{CodeHash, Config, Error, GasMeter, MigrationInProgress, Pallet, Weight, LOG_TARGET};
 use codec::{Codec, Decode, Encode};
 use frame_support::{
 	codec,
@@ -24,15 +24,16 @@ use frame_support::{
 	traits::{ConstU32, Get, OnRuntimeUpgrade},
 	Identity,
 };
-use sp_std::{marker::PhantomData, prelude::*};
+use sp_std::{marker::PhantomData, mem, prelude::*};
 
-type Migrations = (V9, V10);
+type Migrations<T> = (V9<T>, V10<T>);
 type State = BoundedVec<u8, ConstU32<1024>>;
 
 #[derive(Encode, Decode, RuntimeDebug, TypeInfo, MaxEncodedLen)]
 pub enum Progress {
-	Failed,
-	InProgress { version: u16, state: State },
+	InProgress { state: State },
+	Failed { state_before: State },
+	FailedOnInit,
 }
 
 struct WeightedResult<T> {
@@ -40,24 +41,29 @@ struct WeightedResult<T> {
 	result: Result<T, &'static str>,
 }
 
-trait Migrate: Codec + MaxEncodedLen {
+enum IsFinished {
+	Yes,
+	No,
+}
+
+trait Migrate<T: Config>: Codec + MaxEncodedLen {
 	const VERSION: u16;
 
 	fn init() -> WeightedResult<Self>;
 
 	// TODO: replace &mut Weight with a weight meter
-	fn step(&mut self, remaining_weight: &mut Weight) -> Result<bool, &'static str>;
+	fn step(&mut self, remaining_weight: &mut GasMeter<T>) -> Result<IsFinished, &'static str>;
 }
 
-trait MigrateSequence {
+trait MigrateSequence<T: Config> {
 	const VERSION_RANGE: Option<(u16, u16)>;
 
 	fn init(version: StorageVersion) -> WeightedResult<Progress>;
 
 	fn step(
 		version: StorageVersion,
-		remaining_weight: &mut Weight,
-		state: State,
+		remaining_weight: &mut GasMeter<T>,
+		state: &[u8],
 	) -> Result<Option<State>, &'static str>;
 
 	fn integrity_test();
@@ -84,9 +90,12 @@ pub struct Migration<T: Config>(PhantomData<T>);
 
 impl<T: Config> OnRuntimeUpgrade for Migration<T> {
 	fn on_runtime_upgrade() -> Weight {
-		let mut weight = T::DbWeight::get().reads(1);
-		let storage_version = <Pallet<T>>::on_chain_storage_version();
+		// TODO: If `try-runtime` we just run all migrations inside a single block. Otherwise
+		// testing a stack of migrations would entail running the chain for a while.
+
 		let latest_version = <Pallet<T>>::current_storage_version();
+		let storage_version = <Pallet<T>>::on_chain_storage_version();
+		let mut weight = T::DbWeight::get().reads(1);
 
 		if storage_version == latest_version {
 			return weight
@@ -95,31 +104,34 @@ impl<T: Config> OnRuntimeUpgrade for Migration<T> {
 		// In case a migration is already in progress we initialize the next migration
 		// (if any) right when the current one finishes.
 		weight.saturating_accrue(T::DbWeight::get().reads(1));
-		if Self::in_progress() {
+		if in_progress::<T>() {
 			return weight
 		}
 
-		let outcome = Migrations::init(storage_version + 1);
+		let outcome = Migrations::<T>::init(storage_version + 1);
 		weight.saturating_accrue(outcome.weight);
-		weight.saturating_accrue(T::DbWeight::get().writes(1));
 		let progress = match outcome.result {
 			// TODO: emit event that migration has started
 			Ok(migration) => migration,
 			Err(msg) => {
 				log::error!(target: LOG_TARGET, "Failed to init migration: {}", msg);
-				Progress::Failed
+				Progress::FailedOnInit
 			},
 		};
 		MigrationInProgress::<T>::set(Some(progress));
+		weight.saturating_accrue(T::DbWeight::get().writes(1));
 
 		weight
 	}
 
 	#[cfg(feature = "try-runtime")]
 	fn pre_upgrade() -> Result<Vec<u8>, &'static str> {
+		// We can't really do much here as our migrations do not happen during the runtime upgrade.
+		// Instead, we call the migrations `pre_upgrade` and `post_upgrade` hooks when we iterate
+		// over our migrations.
 		let storage_version = <Pallet<T>>::on_chain_storage_version();
 		let target_version = <Pallet<T>>::current_storage_version();
-		if Migrations::is_upgrade_supported(storage_version, target_version) {
+		if Migrations::<T>::is_upgrade_supported(storage_version, target_version) {
 			Ok(Vec::new())
 		} else {
 			Err("New runtime does not contain the required migrations to perform this upgrade.")
@@ -127,23 +139,62 @@ impl<T: Config> OnRuntimeUpgrade for Migration<T> {
 	}
 }
 
-impl<T: Config> Migration<T> {
-	pub fn integrity_test() {
-		Migrations::integrity_test()
-	}
+pub fn integrity_test<T: Config>() {
+	Migrations::<T>::integrity_test()
+}
 
-	pub fn migrate(weight_limit: Weight) -> Result<(), DispatchError> {
-		// TODO: emit event when migration is done
-	}
+pub fn migrate<T: Config>(remaining_weight: &mut GasMeter<T>) -> Result<(), DispatchError> {
+	// TODO: emit event when migration is done
+	// TODO: call pre and post hooks if migration when try_runtime
+	// TODO: update in storage version and trigger next migration if the current one is done
 
-	fn in_progress() -> bool {
-		MigrationInProgress::<T>::exists()
+	MigrationInProgress::<T>::try_mutate_exists(|progress| {
+		let mut state_before = progress
+			.as_mut()
+			.and_then(|progress| match progress {
+				Progress::InProgress { state } => Some(state),
+				_ => None,
+			})
+			.ok_or_else(|| Error::<T>::NoMigrationInProgress)?;
+
+		// if a migration is running it is always upgrading to the next version
+		let storage_version = <Pallet<T>>::on_chain_storage_version();
+		let in_progress_version = storage_version + 1;
+
+		*progress = match Migrations::<T>::step(
+			in_progress_version,
+			remaining_weight,
+			state_before.as_ref(),
+		) {
+			Ok(Some(state)) => Some(Progress::InProgress { state }),
+			Ok(None) => None,
+			Err(err) => {
+				log::error!(
+					target: "LOG_TARGET", "Migration failed while migrating to {:?}: {}",
+					in_progress_version, err,
+				);
+				Some(Progress::Failed { state_before: mem::take(&mut state_before) })
+			},
+		};
+		Ok(())
+	})
+}
+
+fn in_progress<T: Config>() -> bool {
+	MigrationInProgress::<T>::exists()
+}
+
+pub fn ensure_migrated<T: Config>() -> DispatchResult {
+	if in_progress::<T>() {
+		Err(Error::<T>::MigrationInProgress.into())
+	} else {
+		Ok(())
 	}
 }
 
 #[impl_trait_for_tuples::impl_for_tuples(10)]
-#[tuple_types_custom_trait_bound(Migrate)]
-impl MigrateSequence for Tuple {
+#[tuple_types_custom_trait_bound(Migrate<T>)]
+impl<T: Config> MigrateSequence<T> for Tuple {
 	const VERSION_RANGE: Option<(u16, u16)> = {
 		let mut versions: Option<(u16, u16)> = None;
 		for_tuples!(
@@ -171,7 +222,6 @@ impl MigrateSequence for Tuple {
 						weight: outcome.weight,
 						result: outcome.result.and_then(|state| {
 							Ok(Progress::InProgress {
-								version: Tuple::VERSION,
 								state: state.encode().try_into().map_err(|_| "Migration state too big.")?,
 							})
 						})
@@ -187,16 +237,16 @@ impl MigrateSequence for Tuple {
 
 	fn step(
 		version: StorageVersion,
-		remaining_weight: &mut Weight,
-		state: State,
+		remaining_weight: &mut GasMeter<T>,
+		mut state: &[u8],
 	) -> Result<Option<State>, &'static str> {
 		for_tuples!(
 			#(
 				if version == Tuple::VERSION {
-					let mut migration = <Tuple as Decode>::decode(&mut state.as_ref())
+					let mut migration = <Tuple as Decode>::decode(&mut state)
 						.map_err(|_| "Can't decode migration state")?;
-					let finished = migration.step(remaining_weight)?;
-					return Ok(if finished {
+					let is_finished = matches!(migration.step(remaining_weight)?, IsFinished::Yes);
+					return Ok(if is_finished  {
 						None
 					} else {
 						Some(
@@ -230,33 +280,31 @@ impl MigrateSequence for Tuple {
 }
 
 #[derive(Encode, Decode, RuntimeDebug, TypeInfo, MaxEncodedLen)]
-pub struct V9;
+pub struct V9<T: Config>(PhantomData<T>);
 
-impl Migrate for V9 {
+impl<T: Config> Migrate<T> for V9<T> {
 	const VERSION: u16 = 9;
 
 	fn init() -> WeightedResult<Self> {
 		unimplemented!()
 	}
 
-	// TODO: replace &mut Weight with a weight meter
-	fn step(&mut self, _remaining_weight: &mut Weight) -> Result<bool, &'static str> {
+	fn step(&mut self, _remaining_weight: &mut GasMeter<T>) -> Result<IsFinished, &'static str> {
 		unimplemented!()
 	}
 }
 
 #[derive(Encode, Decode, RuntimeDebug, TypeInfo, MaxEncodedLen)]
-pub struct V10;
+pub struct V10<T: Config>(PhantomData<T>);
 
-impl Migrate for V10 {
+impl<T: Config> Migrate<T> for V10<T> {
 	const VERSION: u16 = 10;
 
 	fn init() -> WeightedResult<Self> {
 		unimplemented!()
 	}
 
-	// TODO: replace &mut Weight with a weight meter
-	fn step(&mut self, _remaining_weight: &mut Weight) -> Result<bool, &'static str> {
+	fn step(&mut self, _remaining_weight: &mut GasMeter<T>) -> Result<IsFinished, &'static str> {
 		unimplemented!()
 	}
 }
@@ -305,7 +353,7 @@ mod v9 {
 				initial: old.initial,
 				maximum: old.maximum,
 				code: old.code,
-				determinism: Determinism::Deterministic,
+				determinism: Determinism::Enforced,
 			})
 		});
 	}

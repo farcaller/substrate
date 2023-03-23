@@ -102,7 +102,7 @@ mod tests;
 use crate::{
 	exec::{AccountIdOf, ErrorOrigin, ExecError, Executable, Key, Stack as ExecStack},
 	gas::GasMeter,
-	migration::Progress as MigrationProgress,
+	migration::ensure_migrated,
 	storage::{meter::Meter as StorageMeter, ContractInfo, DeletedContract},
 	wasm::{OwnerInfo, PrefabWasmModule, TryInstantiate},
 	weights::WeightInfo,
@@ -333,11 +333,17 @@ pub mod pallet {
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 		fn on_idle(_block: T::BlockNumber, remaining_weight: Weight) -> Weight {
+			if migration::ensure_migrated::<T>().is_err() {
+				return T::DbWeight::get().reads(1)
+			}
 			ContractInfo::<T>::process_deletion_queue_batch(remaining_weight)
 				.saturating_add(T::WeightInfo::on_process_deletion_queue_batch())
 		}
 
 		fn on_initialize(_block: T::BlockNumber) -> Weight {
+			if migration::ensure_migrated::<T>().is_err() {
+				return T::DbWeight::get().reads(1)
+			}
 			// We want to process the deletion_queue in the on_idle hook. Only in the case
 			// that the queue length has reached its maximal depth, we process it here.
 			let max_len = T::DeletionQueueDepth::get() as usize;
@@ -357,7 +363,7 @@ pub mod pallet {
 		}
 
 		fn integrity_test() {
-			Migration::<T>::integrity_test();
+			migration::integrity_test::<T>();
 
 			// Total runtime memory is expected to have 128Mb upper limit
 			const MAX_RUNTIME_MEM: u32 = 1024 * 1024 * 128;
@@ -537,6 +543,7 @@ pub mod pallet {
 			storage_deposit_limit: Option<<BalanceOf<T> as codec::HasCompact>::Type>,
 			determinism: Determinism,
 		) -> DispatchResult {
+			ensure_migrated::<T>()?;
 			let origin = ensure_signed(origin)?;
 			Self::bare_upload_code(origin, code, storage_deposit_limit.map(Into::into), determinism)
 				.map(|_| ())
@@ -552,6 +559,7 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			code_hash: CodeHash<T>,
 		) -> DispatchResultWithPostInfo {
+			ensure_migrated::<T>()?;
 			let origin = ensure_signed(origin)?;
 			<PrefabWasmModule<T>>::remove(&origin, code_hash)?;
 			// we waive the fee because removing unused code is beneficial
@@ -575,6 +583,7 @@ pub mod pallet {
 			dest: AccountIdLookupOf<T>,
 			code_hash: CodeHash<T>,
 		) -> DispatchResult {
+			ensure_migrated::<T>()?;
 			ensure_root(origin)?;
 			let dest = T::Lookup::lookup(dest)?;
 			<ContractInfoOf<T>>::try_mutate(&dest, |contract| {
@@ -624,6 +633,7 @@ pub mod pallet {
 			storage_deposit_limit: Option<<BalanceOf<T> as codec::HasCompact>::Type>,
 			data: Vec<u8>,
 		) -> DispatchResultWithPostInfo {
+			ensure_migrated::<T>()?;
 			let gas_limit: Weight = gas_limit.into();
 			let origin = ensure_signed(origin)?;
 			let dest = T::Lookup::lookup(dest)?;
@@ -685,6 +695,7 @@ pub mod pallet {
 			data: Vec<u8>,
 			salt: Vec<u8>,
 		) -> DispatchResultWithPostInfo {
+			ensure_migrated::<T>()?;
 			let origin = ensure_signed(origin)?;
 			let code_len = code.len() as u32;
 			let data_len = data.len() as u32;
@@ -728,6 +739,7 @@ pub mod pallet {
 			data: Vec<u8>,
 			salt: Vec<u8>,
 		) -> DispatchResultWithPostInfo {
+			ensure_migrated::<T>()?;
 			let origin = ensure_signed(origin)?;
 			let data_len = data.len() as u32;
 			let salt_len = salt.len() as u32;
@@ -750,6 +762,21 @@ pub mod pallet {
 				output.result.map(|(_address, output)| output),
 				T::WeightInfo::instantiate(data_len, salt_len),
 			)
+		}
+
+		/// TODO: add benchmark for base weight
+		#[pallet::call_index(9)]
+		#[pallet::weight(*weight_limit)]
+		pub fn migrate(origin: OriginFor<T>, weight_limit: Weight) -> DispatchResultWithPostInfo {
+			ensure_signed(origin)?;
+			let mut meter = GasMeter::new(weight_limit);
+			let result = migration::migrate::<T>(&mut meter);
+			meter
+				.into_dispatch_result(result, Weight::from_parts(0, 0))
+				.map(|mut post_info| {
+					post_info.pays_fee = Pays::No;
+					post_info
+				})
 		}
 	}
 
@@ -909,6 +936,8 @@ pub mod pallet {
 		CodeRejected,
 		/// An indetermistic code was used in a context where this is not permitted.
 		Indeterministic,
+		MigrationInProgress,
+		NoMigrationInProgress,
 	}
 
 	/// A mapping from an original code hash to the original code, untouched by instrumentation.
@@ -966,7 +995,7 @@ pub mod pallet {
 
 	#[pallet::storage]
 	pub(crate) type MigrationInProgress<T: Config> =
-		StorageValue<_, MigrationProgress, OptionQuery>;
+		StorageValue<_, migration::Progress, OptionQuery>;
 }
 
 /// Context of a contract invocation.
@@ -1182,6 +1211,9 @@ impl<T: Config> Pallet<T> {
 		debug: bool,
 		determinism: Determinism,
 	) -> ContractExecResult<BalanceOf<T>> {
+		if let Err(err) = ensure_migrated::<T>() {
+			return err.into()
+		}
 		let mut debug_message = if debug { Some(DebugBufferVec::<T>::default()) } else { None };
 		let common = CommonInput {
 			origin,
@@ -1223,6 +1255,9 @@ impl<T: Config> Pallet<T> {
 		salt: Vec<u8>,
 		debug: bool,
 	) -> ContractInstantiateResult<T::AccountId, BalanceOf<T>> {
+		if let Err(err) = ensure_migrated::<T>() {
+			return err.into()
+		}
 		let mut debug_message = if debug { Some(DebugBufferVec::<T>::default()) } else { None };
 		let common = CommonInput {
 			origin,
@@ -1255,6 +1290,7 @@ impl<T: Config> Pallet<T> {
 		storage_deposit_limit: Option<BalanceOf<T>>,
 		determinism: Determinism,
 	) -> CodeUploadResult<CodeHash<T>, BalanceOf<T>> {
+		ensure_migrated::<T>()?;
 		let schedule = T::Schedule::get();
 		let module = PrefabWasmModule::from_code(
 			code,
@@ -1275,6 +1311,9 @@ impl<T: Config> Pallet<T> {
 
 	/// Query storage of a specified contract under a specified key.
 	pub fn get_storage(address: T::AccountId, key: Vec<u8>) -> GetStorageResult {
+		if let Err(_) = ensure_migrated::<T>() {
+			return Err(ContractAccessError::MigrationInProgress)
+		}
 		let contract_info =
 			ContractInfoOf::<T>::get(&address).ok_or(ContractAccessError::DoesntExist)?;
 
